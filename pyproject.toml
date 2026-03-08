@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autostego-srm"
+version = "0.1.0"
+description = "Readable Python port of the MATLAB SRM feature extractor"
+requires-python = ">=3.12"
+dependencies = [
+    "joblib>=1.4",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "scikit-learn>=1.5",
+    "scipy>=1.12",
+    "torch>=2.3",
+    "tqdm>=4.66",
+    "wandb>=0.19",
+    "wonderwords>=2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["steganalysis", "steganography", "utils"]
