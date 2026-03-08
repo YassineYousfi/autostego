@@ -21,13 +21,15 @@ Each experiment runs on all GPUs available. The entire pipeline runs in `eve.py`
 - You can tune current detectors under `steganalysis/`
 - You can create new detectors
 - You can read the algorithms that Alice wrote and reason about their weaknesses and strengths
+- You can make a detector for each algorithm, it doesn't have to be one single detector for all
+- You can give detectors names such as `newnet_for_hill.py`
 
 **What you CANNOT do:**
 - You cannot change the algorithms that Alice wrote in `steganography/`
 - You cannot change the payload
 - You cannot change the dataset for the final evaluations
 
-**The goal is simple: get the lowest val_bpb.**
+**The goal is simple: get the highest val accuracy on each algorithm**
 
 **The first run**: Your very first run should always be to establish a baseline.
 
