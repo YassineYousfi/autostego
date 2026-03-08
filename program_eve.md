@@ -2,9 +2,13 @@
 
 This is an experiment to have LLMs do steganography and steganalysis research
 
-## Setup
+Alice has put her 3 best steganographic algorithms in the `steganography/` directory. Read them. She also embedded a payload of 0.4 bpp in the `data/BOSSbase_1.01/` folder for each algorithm using `steganography/embed_dir.py`. The folders have a 3 word code name but there is a json config file `embed_config.json` in them with the details of the embedding operation.
 
-Alice has put her 3 best steganographic algorithms in the `steganography/` directory. Read them.
+Your goal is to get the best binary detector for each algorithm VS the `cover` images also in `data/BOSSbase_1.01/`.
+
+2 SOTA steganalysis detectors are given to you in the `steganalysis/` folder, feel free to get inspiration from them, tune them, or write completely new ones.
+
+## Setup
 
 1. **Agree on a run tag**: propose a branch tag, the branch `autostego/eve-<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autostego/eve-<tag>` from current branch `autostego/eve`.
@@ -23,6 +27,7 @@ Each experiment runs on all GPUs available. The entire pipeline runs in `eve.py`
 - You can read the algorithms that Alice wrote and reason about their weaknesses and strengths
 - You can make a detector for each algorithm, it doesn't have to be one single detector for all
 - You can give detectors names such as `newnet_for_hill.py`
+- You can change `eve.py` config and detectors as you wish
 
 **What you CANNOT do:**
 - You cannot change the algorithms that Alice wrote in `steganography/`
@@ -33,9 +38,15 @@ Each experiment runs on all GPUs available. The entire pipeline runs in `eve.py`
 
 **The first run**: Your very first run should always be to establish a baseline.
 
-## Output format
+## Result format
+```
+algo_name_1: detector_name_1: best val accuracy
+algo_name_2: detector_name_1: best val accuracy
+algo_name_3: detector_name_1: best val accuracy
+```
 
 ## Logging results
+for each run save the config from `eve.py` and the result file in the desired format in the `runs/` dir.
 
 ## The experiment loop
 
