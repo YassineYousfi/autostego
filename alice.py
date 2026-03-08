@@ -1,10 +1,14 @@
 from __future__ import annotations
-
+import json
 from dataclasses import asdict, dataclass, field, replace
+import os
 from pathlib import Path
-
+import subprocess
+import sys
+import torch
 from steganalysis.lclsmr import LCLSMRConfig, train_classifier
 from steganalysis.srnet import SRNetConfig
+from steganalysis.srnet import SRNET_CONFIG_JSON_ENV
 from steganalysis.srnet import train as train_srnet
 from steganalysis.srm import SRMDirConfig, extract_dir
 from steganography.embed_dir import EmbedDirConfig, embed_dir, generate_stego_dir
@@ -17,7 +21,7 @@ class PipelineConfig:
     cover_dir_name: str = "cover"
     algorithm: str = "hill"
     payload: float = 0.4
-    stego_dir: Path | None = None
+    stego_dir: Path | None = Path("data/BOSSbase_1.01/changeable-sweltering-draft")
     feature_root: Path = Path("data/features")
     feature_model_root: Path = Path("data/features/models")
     run_root: Path = Path("runs")
@@ -26,7 +30,6 @@ class PipelineConfig:
     max_train_files: int | None = 1000
     max_val_files: int | None = 100
     embed_workers: int | None = None
-    srm_gpu_devices: tuple[str, ...] | None = None
     lclsmr: LCLSMRConfig = field(default_factory=LCLSMRConfig)
     srnet: SRNetConfig = field(default_factory=SRNetConfig)
 
@@ -48,6 +51,43 @@ def resolve_paths(config: PipelineConfig) -> dict[str, Path]:
         "linear_output": linear_output,
         "srnet_output": srnet_output,
     }
+
+
+def _distributed_launch_active() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def _cuda_visible_devices(gpu_devices: tuple[str, ...]) -> str:
+    indices = [str(torch.device(device).index or 0) for device in gpu_devices]
+    return ",".join(indices)
+
+
+def _all_cuda_devices() -> tuple[str, ...] | None:
+    if not torch.cuda.is_available():
+        return None
+    return tuple(f"cuda:{index}" for index in range(torch.cuda.device_count()))
+
+
+def run_srnet_training(config: SRNetConfig) -> None:
+    gpu_devices = _all_cuda_devices()
+
+    if gpu_devices is None or len(gpu_devices) <= 1 or _distributed_launch_active():
+        train_srnet(config)
+        return
+
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={len(gpu_devices)}",
+        "-m",
+        "steganalysis.srnet",
+    ]
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(gpu_devices)
+    env[SRNET_CONFIG_JSON_ENV] = json.dumps(asdict(config), default=str)
+    subprocess.run(command, check=True, env=env)
 
 
 def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
@@ -94,7 +134,6 @@ def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
             image_dir=paths["cover_dir"],
             feature_dir=paths["cover_features"],
             image_suffix=config.image_extension,
-            gpu_devices=config.srm_gpu_devices,
             validation_suffix=config.validation_suffix,
             max_train_files=config.max_train_files,
             max_val_files=config.max_val_files,
@@ -105,23 +144,19 @@ def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
             image_dir=paths["stego_dir"],
             feature_dir=paths["stego_features"],
             image_suffix=config.image_extension,
-            gpu_devices=config.srm_gpu_devices,
             validation_suffix=config.validation_suffix,
             max_train_files=config.max_train_files,
             max_val_files=config.max_val_files,
         )
     )
 
-    train_classifier(
-        lclsmr_config
-    )
+    train_classifier(lclsmr_config)
 
-    train_srnet(
-        srnet_config
-    )
+    run_srnet_training(srnet_config)
 
     print(f"Linear report: {paths['linear_output'] / 'classification_report.txt'}")
-    print(f"SRNet report: {paths['srnet_output'] / 'classification_report.txt'}")
+    print(f"SRNet last report: {paths['srnet_output'] / 'classification_report.txt'}")
+    print(f"SRNet best report: {paths['srnet_output'] / 'classification_report_best.txt'}")
     return paths
 
 

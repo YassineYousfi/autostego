@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import json
 import math
 import os
+os.environ['NCCL_P2P_DISABLE'] = '1'
 import random
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -37,12 +39,12 @@ class SRNetConfig:
     num_classes: int = 2
     extensions: tuple[str, ...] = (".ppm",)
     epochs: int = 30
-    batch_size: int = 64
+    batch_size: int = 32
     workers: int = 4
     lr: float = 1e-3
     min_lr: float = 1e-4
     warmup_epochs: int = 3
-    weight_decay: float = 0.
+    weight_decay: float = 1e-2
     seed: int = 1337
     fixed_val_suffix: str | None = "9"
     max_train_pairs: int | None = None
@@ -58,6 +60,32 @@ class SRNetConfig:
 
 
 CONFIG = SRNetConfig()
+SRNET_CONFIG_JSON_ENV = "SRNET_CONFIG_JSON"
+
+
+def config_from_dict(data: dict[str, Any]) -> SRNetConfig:
+    values = dict(data)
+    for key in ("data_root", "output_dir"):
+        if key in values and values[key] is not None:
+            values[key] = Path(values[key])
+
+    if "pretrained_checkpoint" in values and values["pretrained_checkpoint"] is not None:
+        checkpoint = values["pretrained_checkpoint"]
+        values["pretrained_checkpoint"] = checkpoint if is_url(checkpoint) else Path(checkpoint)
+
+    if "extensions" in values and values["extensions"] is not None:
+        values["extensions"] = tuple(values["extensions"])
+
+    return SRNetConfig(**values)
+
+
+def load_config(path: str | Path) -> SRNetConfig:
+    config_path = Path(path)
+    return config_from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+
+
+def load_config_json(raw_config: str) -> SRNetConfig:
+    return config_from_dict(json.loads(raw_config))
 
 
 def conv3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
@@ -236,8 +264,8 @@ def setup_distributed() -> DistributedContext:
     distributed = world_size > 1
 
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        device = torch.device("cuda", local_rank if distributed else 0)
+        torch.cuda.set_device(device)
         backend = "nccl"
     else:
         device = torch.device("cpu")
@@ -458,6 +486,13 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     best_val_acc: float,
     is_best: bool,
+    *,
+    config: SRNetConfig,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray,
+    train_pairs: int,
+    val_pairs: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     module = model.module if isinstance(model, DistributedDataParallel) else model
@@ -468,8 +503,10 @@ def save_checkpoint(
         "best_val_acc": best_val_acc,
     }
     torch.save(checkpoint, output_dir / "last.pt")
+    save_validation_outputs(config, y_true, y_pred, y_prob, train_pairs, val_pairs, label="last")
     if is_best:
         torch.save(checkpoint, output_dir / "best.pt")
+        save_validation_outputs(config, y_true, y_pred, y_prob, train_pairs, val_pairs, label="best")
 
 
 def build_model(config: SRNetConfig, device: torch.device) -> nn.Module:
@@ -508,6 +545,8 @@ def save_validation_outputs(
     y_prob: np.ndarray,
     train_pairs: int,
     val_pairs: int,
+    *,
+    label: str = "last",
 ) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     metrics = {
@@ -518,9 +557,11 @@ def save_validation_outputs(
         "val_accuracy": float(accuracy_score(y_true, y_pred)),
         "val_log_loss": float(log_loss(y_true, y_prob)),
     }
-    save_json(config.output_dir / "metrics.json", metrics)
+    metrics_name = "metrics.json" if label == "last" else f"metrics_{label}.json"
+    report_stem = "classification_report" if label == "last" else f"classification_report_{label}"
+    save_json(config.output_dir / metrics_name, metrics)
     save_json(config.output_dir / "train_config.json", asdict(config))
-    save_classification_outputs(config.output_dir, y_true, y_pred)
+    save_classification_outputs(config.output_dir, y_true, y_pred, report_stem=report_stem)
 
 
 def lr_for_epoch(config: SRNetConfig, epoch: int) -> float:
@@ -638,18 +679,39 @@ def train(config: SRNetConfig = CONFIG) -> None:
                     },
                     step=epoch,
                 )
-                if y_true is not None and y_pred is not None and y_prob is not None:
-                    save_validation_outputs(config, y_true, y_pred, y_prob, len(train_pairs), len(val_pairs))
                 is_best = val_acc > best_val_acc
-                best_val_acc = max(best_val_acc, val_acc)
-                save_checkpoint(config.output_dir, epoch, model, optimizer, best_val_acc, is_best)
+                if is_best:
+                    best_val_acc = val_acc
+                save_checkpoint(
+                    config.output_dir,
+                    epoch,
+                    model,
+                    optimizer,
+                    best_val_acc,
+                    is_best,
+                    config=config,
+                    y_true=y_true,
+                    y_pred=y_pred,
+                    y_prob=y_prob,
+                    train_pairs=len(train_pairs),
+                    val_pairs=len(val_pairs),
+                )
     finally:
         finish_wandb(ctx)
         cleanup_distributed(ctx)
 
 
 def main() -> None:
-    train(CONFIG)
+    parser = argparse.ArgumentParser(description="Train SRNet steganalysis model")
+    parser.add_argument("--config", type=Path, help="Path to a JSON-serialized SRNetConfig", default=None)
+    args = parser.parse_args()
+    if args.config is not None:
+        config = load_config(args.config)
+    elif SRNET_CONFIG_JSON_ENV in os.environ:
+        config = load_config_json(os.environ[SRNET_CONFIG_JSON_ENV])
+    else:
+        config = CONFIG
+    train(config)
 
 
 if __name__ == "__main__":

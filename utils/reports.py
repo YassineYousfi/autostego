@@ -13,6 +13,7 @@ def save_classification_outputs(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     *,
+    report_stem: str = "classification_report",
     target_names: tuple[str, str] = ("cover", "stego"),
 ) -> dict[str, object]:
     report = classification_report(
@@ -29,6 +30,6 @@ def save_classification_outputs(
         digits=4,
         zero_division=0,
     )
-    save_json(output_dir / "classification_report.json", report)
-    (output_dir / "classification_report.txt").write_text(report_text + "\n", encoding="utf-8")
+    save_json(output_dir / f"{report_stem}.json", report)
+    (output_dir / f"{report_stem}.txt").write_text(report_text + "\n", encoding="utf-8")
     return report
