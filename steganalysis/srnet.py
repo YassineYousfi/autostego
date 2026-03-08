@@ -20,7 +20,7 @@ from sklearn.metrics import accuracy_score, log_loss
 from timm.models._manipulate import adapt_input_conv
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.files import relative_stem, save_json, select_split_paths, split_relative_keys
@@ -39,12 +39,12 @@ class SRNetConfig:
     num_classes: int = 2
     extensions: tuple[str, ...] = (".ppm",)
     epochs: int = 30
-    batch_size: int = 32
+    batch_size: int = 8
     workers: int = 4
     lr: float = 1e-3
     min_lr: float = 1e-4
     warmup_epochs: int = 3
-    weight_decay: float = 1e-2
+    weight_decay: float = 0.
     seed: int = 1337
     fixed_val_suffix: str | None = "9"
     max_train_pairs: int | None = None
@@ -257,6 +257,21 @@ class DistributedContext:
     device: torch.device
 
 
+class DistributedEvalSampler(Sampler[int]):
+    def __init__(self, dataset: Dataset[object], *, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        if self.rank >= len(self.dataset):
+            return 0
+        return (len(self.dataset) - self.rank + self.world_size - 1) // self.world_size
+
+
 def setup_distributed() -> DistributedContext:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -376,12 +391,19 @@ def build_dataloader(
     dataset: Dataset[tuple[Tensor, Tensor]],
     batch_size: int,
     workers: int,
-    distributed: bool,
+    ctx: DistributedContext,
     shuffle: bool,
     drop_last: bool,
-) -> tuple[DataLoader[tuple[Tensor, Tensor]], DistributedSampler | None]:
+    pad_distributed: bool = True,
+) -> tuple[DataLoader[tuple[Tensor, Tensor]], Sampler[int] | None]:
     effective_batch_size = max(1, min(batch_size, len(dataset)))
-    sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+    sampler: Sampler[int] | None = None
+    if ctx.distributed:
+        if pad_distributed:
+            sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
+        else:
+            sampler = DistributedEvalSampler(dataset, rank=ctx.rank, world_size=ctx.world_size)
+    sampler_length = len(sampler) if sampler is not None else len(dataset)
     loader = DataLoader(
         dataset,
         batch_size=effective_batch_size,
@@ -390,7 +412,7 @@ def build_dataloader(
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=workers > 0,
-        drop_last=drop_last and len(dataset) > effective_batch_size,
+        drop_last=drop_last and sampler_length > effective_batch_size,
         collate_fn=pair_collate,
     )
     return loader, sampler
@@ -416,6 +438,12 @@ def gather_numpy(array: np.ndarray, ctx: DistributedContext) -> np.ndarray:
     return np.concatenate([item for item in gathered if item is not None], axis=0)
 
 
+def empty_numpy_batches(*, dtype: np.dtype[Any], width: int | None = None) -> np.ndarray:
+    if width is None:
+        return np.empty((0,), dtype=dtype)
+    return np.empty((0, width), dtype=dtype)
+
+
 def autocast_context(device: torch.device, enabled: bool):
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
 
@@ -426,6 +454,7 @@ def run_epoch(
     criterion: nn.Module,
     device: torch.device,
     ctx: DistributedContext,
+    num_classes: int,
     optimizer: torch.optim.Optimizer | None = None,
     amp: bool = True,
     collect_predictions: bool = False,
@@ -473,9 +502,17 @@ def run_epoch(
     if not collect_predictions:
         return mean_loss, accuracy, None, None, None
 
-    y_true = gather_numpy(np.concatenate(all_labels, axis=0), ctx)
-    y_pred = gather_numpy(np.concatenate(all_predictions, axis=0), ctx)
-    y_prob = gather_numpy(np.concatenate(all_probabilities, axis=0), ctx)
+    local_y_true = np.concatenate(all_labels, axis=0) if all_labels else empty_numpy_batches(dtype=np.int64)
+    local_y_pred = np.concatenate(all_predictions, axis=0) if all_predictions else empty_numpy_batches(dtype=np.int64)
+    local_y_prob = (
+        np.concatenate(all_probabilities, axis=0)
+        if all_probabilities
+        else empty_numpy_batches(dtype=np.float32, width=num_classes)
+    )
+
+    y_true = gather_numpy(local_y_true, ctx)
+    y_pred = gather_numpy(local_y_pred, ctx)
+    y_prob = gather_numpy(local_y_prob, ctx)
     return mean_loss, accuracy, y_true, y_pred, y_prob
 
 
@@ -603,17 +640,19 @@ def train(config: SRNetConfig = CONFIG) -> None:
             train_dataset,
             config.batch_size,
             config.workers,
-            ctx.distributed,
+            ctx,
             shuffle=True,
             drop_last=True,
+            pad_distributed=True,
         )
         val_loader, _ = build_dataloader(
             val_dataset,
             config.batch_size,
             config.workers,
-            ctx.distributed,
+            ctx,
             shuffle=False,
             drop_last=False,
+            pad_distributed=False,
         )
 
         model = build_model(config, ctx.device)
@@ -630,7 +669,10 @@ def train(config: SRNetConfig = CONFIG) -> None:
         best_val_acc = -1.0
         if is_main_process(ctx):
             print(f"train pairs: {len(train_pairs)} | val pairs: {len(val_pairs)}")
-            print(f"images per optimization step: {min(config.batch_size, len(train_dataset)) * 2}")
+            print(
+                "images per optimization step: "
+                f"{min(config.batch_size, len(train_dataset)) * 2 * ctx.world_size}"
+            )
             print(f"cover dir: {config.cover_dir} | stego dir: {config.stego_dir}")
 
         for epoch in range(1, config.epochs + 1):
@@ -646,6 +688,7 @@ def train(config: SRNetConfig = CONFIG) -> None:
                 criterion,
                 ctx.device,
                 ctx,
+                config.num_classes,
                 optimizer=optimizer,
                 amp=config.amp,
             )
@@ -656,6 +699,7 @@ def train(config: SRNetConfig = CONFIG) -> None:
                     criterion,
                     ctx.device,
                     ctx,
+                    config.num_classes,
                     optimizer=None,
                     amp=config.amp,
                     collect_predictions=True,

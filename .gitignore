@@ -17,5 +17,6 @@ tests/
 *.pth
 *.joblib
 *.npy
+*.ipynb
 
 .DS_Store
