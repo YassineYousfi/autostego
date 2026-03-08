@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import random
 from dataclasses import asdict
@@ -33,6 +34,8 @@ class TrainConfig:
     batch_size: int = 32
     workers: int = 4
     lr: float = 1e-3
+    min_lr: float = 1e-5
+    warmup_epochs: int = 3
     weight_decay: float = 1e-4
     seed: int = 1337
     fixed_val_suffix: str | None = "9"
@@ -122,9 +125,19 @@ def load_grayscale_tensor(path: Path) -> Tensor:
     return torch.from_numpy(array).unsqueeze(0)
 
 
+def augment_pair_images(images: Tensor) -> Tensor:
+    if random.random() < 0.5:
+        images = torch.flip(images, dims=(-1,))
+    rotations = random.randint(0, 3)
+    if rotations:
+        images = torch.rot90(images, k=rotations, dims=(-2, -1))
+    return images
+
+
 class PairDataset(Dataset[tuple[Tensor, Tensor]]):
-    def __init__(self, pairs: Sequence[CoverStegoPair]) -> None:
+    def __init__(self, pairs: Sequence[CoverStegoPair], augment: bool = False) -> None:
         self.pairs = list(pairs)
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -132,6 +145,8 @@ class PairDataset(Dataset[tuple[Tensor, Tensor]]):
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         pair = self.pairs[index]
         images = torch.stack((load_grayscale_tensor(pair.cover), load_grayscale_tensor(pair.stego)), dim=0)
+        if self.augment:
+            images = augment_pair_images(images)
         labels = torch.tensor((0, 1), dtype=torch.long)
         return images, labels
 
@@ -205,6 +220,12 @@ def build_pairs(config: TrainConfig) -> tuple[list[CoverStegoPair], Path]:
     if not cover_paths:
         raise FileNotFoundError(f"No cover images found in {cover_root}")
 
+    stego_paths = collect_images(stego_root, config.extensions)
+    if not stego_paths:
+        raise FileNotFoundError(f"No stego images found in {stego_root}")
+
+    stego_lookup = {relative_stem(path, stego_root): path for path in stego_paths}
+
     if config.fixed_val_suffix is not None:
         train_cover_paths, val_cover_paths = select_split_paths(
             cover_paths,
@@ -225,14 +246,18 @@ def build_pairs(config: TrainConfig) -> tuple[list[CoverStegoPair], Path]:
 
     pairs: list[CoverStegoPair] = []
     for cover_path in selected_cover_paths:
-        relative_path = cover_path.relative_to(cover_root)
-        stego_path = stego_root / relative_path
-        if not stego_path.is_file():
-            raise FileNotFoundError(f"Missing stego counterpart for {cover_path}: expected {stego_path}")
+        key = relative_stem(cover_path, cover_root)
+        stego_path = stego_lookup.get(key)
+        if stego_path is None:
+            continue
         pairs.append(CoverStegoPair(cover=cover_path, stego=stego_path))
 
     if len(pairs) < 2:
         raise ValueError("Need at least 2 cover/stego pairs for training.")
+    print(
+        f"Image pairs surviving intersection: {len(pairs)} "
+        f"(selected_cover={len(selected_cover_paths)}, stego={len(stego_paths)})"
+    )
     return pairs, cover_root
 
 
@@ -429,6 +454,26 @@ def save_validation_outputs(
     save_classification_outputs(config.output_dir, y_true, y_pred)
 
 
+def lr_for_epoch(config: TrainConfig, epoch: int) -> float:
+    if config.epochs <= 1:
+        return config.lr
+
+    warmup_epochs = min(config.warmup_epochs, config.epochs)
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        warmup_progress = epoch / warmup_epochs
+        return config.min_lr + (config.lr - config.min_lr) * warmup_progress
+
+    decay_steps = max(1, config.epochs - warmup_epochs)
+    decay_progress = (epoch - warmup_epochs) / decay_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return config.min_lr + (config.lr - config.min_lr) * cosine
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
 def train(config: TrainConfig = CONFIG) -> None:
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -442,8 +487,8 @@ def train(config: TrainConfig = CONFIG) -> None:
         pairs, cover_root = build_pairs(config)
         train_pairs, val_pairs = split_pairs(pairs, cover_root, config)
 
-        train_dataset = PairDataset(train_pairs)
-        val_dataset = PairDataset(val_pairs)
+        train_dataset = PairDataset(train_pairs, augment=True)
+        val_dataset = PairDataset(val_pairs, augment=False)
         train_loader, train_sampler = build_dataloader(
             train_dataset,
             config.batch_size,
@@ -482,6 +527,9 @@ def train(config: TrainConfig = CONFIG) -> None:
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
+            current_lr = lr_for_epoch(config, epoch)
+            set_optimizer_lr(optimizer, current_lr)
+
             train_loss, train_acc, _, _, _ = run_epoch(
                 model,
                 train_loader,
@@ -506,12 +554,14 @@ def train(config: TrainConfig = CONFIG) -> None:
             if is_main_process(ctx):
                 print(
                     f"epoch {epoch:03d} | "
+                    f"lr={current_lr:.6g} | "
                     f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
                     f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
                 )
                 wandb.log(
                     {
                         "epoch": epoch,
+                        "lr": current_lr,
                         "train/loss": train_loss,
                         "train/acc": train_acc,
                         "val/loss": val_loss,

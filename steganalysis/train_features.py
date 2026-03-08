@@ -43,6 +43,11 @@ def pair_feature_paths(cover_dir: Path, stego_dir: Path, suffix: str) -> tuple[l
     if not common_keys:
         raise ValueError("No matching cover/stego feature files found.")
 
+    print(
+        f"Feature pairs surviving intersection: {len(common_keys)} "
+        f"(cover={len(cover_paths)}, stego={len(stego_paths)})"
+    )
+
     paired_cover = [cover_dir / f"{key}{suffix}" for key in common_keys]
     paired_stego = [stego_dir / f"{key}{suffix}" for key in common_keys]
     return paired_cover, paired_stego

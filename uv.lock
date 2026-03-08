@@ -16,7 +16,7 @@ wheels = [
 ]
 
 [[package]]
-name = "autostego-srm"
+name = "autostego"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
