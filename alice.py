@@ -26,15 +26,15 @@ class PipelineConfig:
     max_train_files: int | None = 1000
     max_val_files: int | None = 100
     embed_workers: int | None = None
-    srm_workers: int | None = None
+    srm_gpu_devices: tuple[str, ...] | None = None
     feature_max_iter: int = 2000
     srnet_epochs: int = 30
-    srnet_batch_size: int = 32
+    srnet_batch_size: int = 64
     srnet_workers: int = 4
     srnet_lr: float = 1e-3
-    srnet_min_lr: float = 1e-5
+    srnet_min_lr: float = 1e-4
     srnet_warmup_epochs: int = 3
-    srnet_amp: bool = True
+    srnet_amp: bool = False
     srnet_wandb_mode: str = "offline"
 
 
@@ -80,7 +80,7 @@ def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
             image_dir=paths["cover_dir"],
             feature_dir=paths["cover_features"],
             image_suffix=config.image_extension,
-            max_workers=config.srm_workers,
+            gpu_devices=config.srm_gpu_devices,
             validation_suffix=config.validation_suffix,
             max_train_files=config.max_train_files,
             max_val_files=config.max_val_files,
@@ -91,7 +91,7 @@ def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
             image_dir=paths["stego_dir"],
             feature_dir=paths["stego_features"],
             image_suffix=config.image_extension,
-            max_workers=config.srm_workers,
+            gpu_devices=config.srm_gpu_devices,
             validation_suffix=config.validation_suffix,
             max_train_files=config.max_train_files,
             max_val_files=config.max_val_files,
