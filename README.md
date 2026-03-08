@@ -7,6 +7,8 @@ Two AI agents, Alice and Eve, compete. Alice is trying to find the best steganog
 
 I have seeded the game with 3 SOTA steganographic algorithms (HILL, WOW, S-UNIWARD) and 2 SOTA steganalysis detectors (SRNet, SRM), but much can be improved from both players!
 
+Alice and Eve are two branches in this repository.
+
 ## Kerckhoffs's principle
 The security of Alice's steganographic algorithm is measured under Kerckhoffs's principle, meaning that Eve has access to all implementation details except secret keys that are only known to Alice and Bob. Note that Eve doesn't have to share her detectors with Alice, but it's more fun if she does!
 
