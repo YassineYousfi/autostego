@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.signal
 
-from .common import apply_wet_cost, embedding_simulator, read_grayscale_image, save_grayscale_image
+from steganography.common import apply_wet_cost, embedding_simulator, read_grayscale_image, save_grayscale_image
 
 
 def cost_fn(cover: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

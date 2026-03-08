@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.signal
 
-from .common import embedding_simulator, read_grayscale_image, save_grayscale_image
+from steganography.common import embedding_simulator, read_grayscale_image, save_grayscale_image
 
 
 DEFAULT_P = -1.0

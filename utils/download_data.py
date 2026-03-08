@@ -7,7 +7,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .files import collect_files, ensure_directory
+from utils.files import collect_files, ensure_directory
 
 
 @dataclass(slots=True)
