@@ -187,8 +187,12 @@ def _partition_round_robin(paths: list[Path], partition_count: int) -> list[list
 srm = extract_srm_gpu
 
 
+def detect(config: SRMDirConfig = CONFIG) -> list[Path]:
+    return extract_dir(config)
+
+
 def main() -> None:
-    extract_dir(CONFIG)
+    detect(CONFIG)
 
 
 if __name__ == "__main__":

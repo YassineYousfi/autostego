@@ -32,8 +32,8 @@ DEFAULT_SRNET_CHECKPOINT_PATH = Path("assets/checkpoints/jin_srnet.ckpt")
 @dataclass(slots=True)
 class SRNetConfig:
     data_root: Path = Path("data")
-    cover_dir: str = "cover"
-    stego_dir: str = "stego"
+    cover_dir_name: str = "cover"
+    stego_dir_name: str = "stego"
     output_dir: Path = Path("runs/srnet")
     in_channels: int = 1
     num_classes: int = 2
@@ -315,8 +315,8 @@ def collect_images(root: Path, extensions: Sequence[str]) -> list[Path]:
 
 
 def build_pairs(config: SRNetConfig) -> tuple[list[CoverStegoPair], Path]:
-    cover_root = config.data_root / config.cover_dir
-    stego_root = config.data_root / config.stego_dir
+    cover_root = config.data_root / config.cover_dir_name
+    stego_root = config.data_root / config.stego_dir_name
     if not cover_root.is_dir():
         raise FileNotFoundError(f"Cover directory not found: {cover_root}")
     if not stego_root.is_dir():
@@ -673,7 +673,7 @@ def train(config: SRNetConfig = CONFIG) -> None:
                 "images per optimization step: "
                 f"{min(config.batch_size, len(train_dataset)) * 2 * ctx.world_size}"
             )
-            print(f"cover dir: {config.cover_dir} | stego dir: {config.stego_dir}")
+            print(f"cover dir: {config.cover_dir_name} | stego dir: {config.stego_dir_name}")
 
         for epoch in range(1, config.epochs + 1):
             if train_sampler is not None:
@@ -745,6 +745,10 @@ def train(config: SRNetConfig = CONFIG) -> None:
         cleanup_distributed(ctx)
 
 
+def detect(config: SRNetConfig = CONFIG) -> None:
+    train(config)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train SRNet steganalysis model")
     parser.add_argument("--config", type=Path, help="Path to a JSON-serialized SRNetConfig", default=None)
@@ -755,7 +759,7 @@ def main() -> None:
         config = load_config_json(os.environ[SRNET_CONFIG_JSON_ENV])
     else:
         config = CONFIG
-    train(config)
+    detect(config)
 
 
 if __name__ == "__main__":

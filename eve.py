@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import json
 from dataclasses import asdict, dataclass, field, replace
 import os
@@ -6,12 +7,10 @@ from pathlib import Path
 import subprocess
 import sys
 import torch
-from steganalysis.lclsmr import LCLSMRConfig, train_classifier
+from steganalysis.lclsmr import LCLSMRConfig, detect as detect_lclsmr
 from steganalysis.srnet import SRNetConfig
 from steganalysis.srnet import SRNET_CONFIG_JSON_ENV
-from steganalysis.srnet import train as train_srnet
-from steganalysis.srm import SRMDirConfig, extract_dir
-from steganography.embed_dir import EmbedDirConfig, embed_dir, generate_stego_dir
+from steganalysis.srnet import detect as detect_srnet
 from utils.files import save_json
 
 
@@ -19,9 +18,8 @@ from utils.files import save_json
 class PipelineConfig:
     data_root: Path = Path("data/BOSSbase_1.01")
     cover_dir_name: str = "cover"
-    algorithm: str = "hill"
-    payload: float = 0.4
-    stego_dir: Path | None = Path("data/BOSSbase_1.01/changeable-sweltering-draft")
+    stego_dir_name: str = "changeable-sweltering-draft"
+    detectors: list[str] = field(default_factory=lambda: ["lclsmr", "srnet"])
     feature_root: Path = Path("data/features")
     feature_model_root: Path = Path("data/features/models")
     run_root: Path = Path("runs")
@@ -29,7 +27,6 @@ class PipelineConfig:
     validation_suffix: str | None = "9"
     max_train_files: int | None = 1000
     max_val_files: int | None = 100
-    embed_workers: int | None = None
     lclsmr: LCLSMRConfig = field(default_factory=LCLSMRConfig)
     srnet: SRNetConfig = field(default_factory=SRNetConfig)
 
@@ -37,19 +34,19 @@ class PipelineConfig:
 CONFIG = PipelineConfig()
 
 
-def resolve_paths(config: PipelineConfig) -> dict[str, Path]:
-    cover_dir = config.data_root / config.cover_dir_name
-    stego_dir = config.stego_dir or generate_stego_dir(config.data_root)
+def resolve_pipeline_paths(config: PipelineConfig) -> dict[str, Path]:
+    cover_dir_path = config.data_root / config.cover_dir_name
+    stego_dir_path = config.data_root / config.stego_dir_name
     feature_root = config.feature_root / config.data_root.name
-    linear_output = config.feature_model_root / f"{stego_dir.name}_linear"
-    srnet_output = config.run_root / f"srnet_{stego_dir.name}"
+    linear_output_dir = config.feature_model_root / f"{stego_dir_path.name}_linear"
+    srnet_output_dir = config.run_root / f"srnet_{stego_dir_path.name}"
     return {
-        "cover_dir": cover_dir,
-        "stego_dir": stego_dir,
-        "cover_features": feature_root / config.cover_dir_name,
-        "stego_features": feature_root / stego_dir.name,
-        "linear_output": linear_output,
-        "srnet_output": srnet_output,
+        "cover_dir_path": cover_dir_path,
+        "stego_dir_path": stego_dir_path,
+        "cover_feature_dir": feature_root / config.cover_dir_name,
+        "stego_feature_dir": feature_root / config.stego_dir_name,
+        "linear_output_dir": linear_output_dir,
+        "srnet_output_dir": srnet_output_dir,
     }
 
 
@@ -72,7 +69,7 @@ def run_srnet_training(config: SRNetConfig) -> None:
     gpu_devices = _all_cuda_devices()
 
     if gpu_devices is None or len(gpu_devices) <= 1 or _distributed_launch_active():
-        train_srnet(config)
+        detect_srnet(config)
         return
 
     command = [
@@ -90,74 +87,61 @@ def run_srnet_training(config: SRNetConfig) -> None:
     subprocess.run(command, check=True, env=env)
 
 
-def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
-    paths = resolve_paths(config)
-    save_json(config.run_root / f"pipeline_{paths['stego_dir'].name}.json", asdict(config))
-
+def run_lclsmr_detector(config: PipelineConfig, paths: dict[str, Path]) -> Path:
     lclsmr_config = replace(
         config.lclsmr,
-        cover_feature_dir=paths["cover_features"],
-        stego_feature_dir=paths["stego_features"],
-        output_dir=paths["linear_output"],
+        data_root=config.data_root,
+        cover_dir_name=config.cover_dir_name,
+        stego_dir_name=config.stego_dir_name,
+        feature_root=config.feature_root / config.data_root.name,
+        output_dir=paths["linear_output_dir"],
+        image_suffix=config.image_extension,
         fixed_val_suffix=config.validation_suffix,
         max_train_pairs=config.max_train_files,
         max_val_pairs=config.max_val_files,
     )
+    detect_lclsmr(lclsmr_config)
+    return paths["linear_output_dir"]
+
+
+def run_srnet_detector(config: PipelineConfig, paths: dict[str, Path]) -> Path:
     srnet_config = replace(
         config.srnet,
         data_root=config.data_root,
-        cover_dir=config.cover_dir_name,
-        stego_dir=paths["stego_dir"].name,
-        output_dir=paths["srnet_output"],
+        cover_dir_name=config.cover_dir_name,
+        stego_dir_name=paths["stego_dir_path"].name,
+        output_dir=paths["srnet_output_dir"],
         extensions=(config.image_extension,),
         fixed_val_suffix=config.validation_suffix,
         max_train_pairs=config.max_train_files,
         max_val_pairs=config.max_val_files,
     )
-
-    embed_dir(
-        EmbedDirConfig(
-            algorithm=config.algorithm,
-            cover_dir=paths["cover_dir"],
-            stego_dir=paths["stego_dir"],
-            payload=config.payload,
-            max_workers=config.embed_workers,
-            extension=config.image_extension,
-            validation_suffix=config.validation_suffix,
-            max_train_files=config.max_train_files,
-            max_val_files=config.max_val_files,
-        )
-    )
-
-    extract_dir(
-        SRMDirConfig(
-            image_dir=paths["cover_dir"],
-            feature_dir=paths["cover_features"],
-            image_suffix=config.image_extension,
-            validation_suffix=config.validation_suffix,
-            max_train_files=config.max_train_files,
-            max_val_files=config.max_val_files,
-        )
-    )
-    extract_dir(
-        SRMDirConfig(
-            image_dir=paths["stego_dir"],
-            feature_dir=paths["stego_features"],
-            image_suffix=config.image_extension,
-            validation_suffix=config.validation_suffix,
-            max_train_files=config.max_train_files,
-            max_val_files=config.max_val_files,
-        )
-    )
-
-    train_classifier(lclsmr_config)
-
     run_srnet_training(srnet_config)
+    return paths["srnet_output_dir"]
 
-    print(f"Linear report: {paths['linear_output'] / 'classification_report.txt'}")
-    print(f"SRNet last report: {paths['srnet_output'] / 'classification_report.txt'}")
-    print(f"SRNet best report: {paths['srnet_output'] / 'classification_report_best.txt'}")
-    return paths
+
+def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
+    paths = resolve_pipeline_paths(config)
+    save_json(config.run_root / f"pipeline_{paths['stego_dir_path'].name}.json", asdict(config))
+
+    detector_runners = {
+        "lclsmr": lambda: run_lclsmr_detector(config, paths),
+        "srnet": lambda: run_srnet_detector(config, paths),
+    }
+
+    outputs = dict(paths)
+    for detector_name in config.detectors:
+        runner = detector_runners.get(detector_name)
+        if runner is None:
+            available = ", ".join(sorted(detector_runners))
+            raise ValueError(f"Unknown detector '{detector_name}'. Expected one of: {available}")
+        outputs[f"{detector_name}_output"] = runner()
+
+    if "lclsmr" in config.detectors:
+        print(f"Linear report: {paths['linear_output_dir'] / 'classification_report.txt'}")
+    if "srnet" in config.detectors:
+        print(f"SRNet best report: {paths['srnet_output_dir'] / 'classification_report_best.txt'}")
+    return outputs
 
 
 def main() -> None:

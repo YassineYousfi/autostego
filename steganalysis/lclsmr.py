@@ -9,15 +9,20 @@ from sklearn.metrics import accuracy_score, log_loss
 from tqdm import tqdm
 
 from steganalysis._lclsmr import LCLSMRClassifier
+from steganalysis.srm import SRMDirConfig, extract_dir
 from utils.files import collect_files, relative_stem_set, save_json, split_relative_keys
 from utils.reports import save_classification_outputs
 
 
 @dataclass(slots=True)
 class LCLSMRConfig:
-    cover_feature_dir: Path = Path("data/features/BOSSbase_1.01/cover")
-    stego_feature_dir: Path = Path("data/features/BOSSbase_1.01/hill")
+    data_root: Path = Path("data/BOSSbase_1.01")
+    cover_dir_name: str = "cover"
+    stego_dir_name: str = "hill"
+    feature_root: Path = Path("data/features/BOSSbase_1.01")
     output_dir: Path = Path("data/features/models/hill_linear")
+    image_suffix: str = ".pgm"
+    gpu_devices: tuple[str, ...] | None = None
     feature_suffix: str = ".npy"
     seed: int = 1337
     cv_tolerance_grid: tuple[float, ...] = (3e-5, 1e-5, 3e-6, 1e-6)
@@ -31,14 +36,14 @@ class LCLSMRConfig:
 CONFIG = LCLSMRConfig()
 
 
-def pair_feature_paths(cover_dir: Path, stego_dir: Path, suffix: str) -> tuple[list[Path], list[Path]]:
-    cover_paths = collect_files(cover_dir, suffix)
-    stego_paths = collect_files(stego_dir, suffix)
+def pair_feature_paths(cover_feature_dir: Path, stego_feature_dir: Path, suffix: str) -> tuple[list[Path], list[Path]]:
+    cover_paths = collect_files(cover_feature_dir, suffix)
+    stego_paths = collect_files(stego_feature_dir, suffix)
     if not cover_paths or not stego_paths:
         raise FileNotFoundError("Cover and stego feature directories must both contain feature files.")
 
-    cover_keys = relative_stem_set(cover_paths, cover_dir)
-    stego_keys = relative_stem_set(stego_paths, stego_dir)
+    cover_keys = relative_stem_set(cover_paths, cover_feature_dir)
+    stego_keys = relative_stem_set(stego_paths, stego_feature_dir)
     common_keys = sorted(cover_keys & stego_keys)
     if not common_keys:
         raise ValueError("No matching cover/stego feature files found.")
@@ -48,8 +53,8 @@ def pair_feature_paths(cover_dir: Path, stego_dir: Path, suffix: str) -> tuple[l
         f"(cover={len(cover_paths)}, stego={len(stego_paths)})"
     )
 
-    paired_cover = [cover_dir / f"{key}{suffix}" for key in common_keys]
-    paired_stego = [stego_dir / f"{key}{suffix}" for key in common_keys]
+    paired_cover = [cover_feature_dir / f"{key}{suffix}" for key in common_keys]
+    paired_stego = [stego_feature_dir / f"{key}{suffix}" for key in common_keys]
     return paired_cover, paired_stego
 
 
@@ -61,8 +66,10 @@ def load_feature_matrix(paths: list[Path], label: int) -> tuple[np.ndarray, np.n
 
 
 def build_dataset(config: LCLSMRConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    cover_paths, stego_paths = pair_feature_paths(config.cover_feature_dir, config.stego_feature_dir, config.feature_suffix)
-    common_keys = [str(path.relative_to(config.cover_feature_dir).with_suffix("")) for path in cover_paths]
+    resolved_cover_feature_dir = config.feature_root / config.cover_dir_name
+    resolved_stego_feature_dir = config.feature_root / config.stego_dir_name
+    cover_paths, stego_paths = pair_feature_paths(resolved_cover_feature_dir, resolved_stego_feature_dir, config.feature_suffix)
+    common_keys = [str(path.relative_to(resolved_cover_feature_dir).with_suffix("")) for path in cover_paths]
     cover_lookup = {key: path for key, path in zip(common_keys, cover_paths, strict=True)}
     stego_lookup = {key: path for key, path in zip(common_keys, stego_paths, strict=True)}
 
@@ -90,11 +97,43 @@ def build_dataset(config: LCLSMRConfig) -> tuple[np.ndarray, np.ndarray, np.ndar
     return x_train, y_train, x_val, y_val
 
 
-def train_classifier(config: LCLSMRConfig = CONFIG) -> tuple[LCLSMRClassifier, dict[str, float]]:
-    if not config.cover_feature_dir.is_dir():
-        raise FileNotFoundError(f"Cover feature directory not found: {config.cover_feature_dir}")
-    if not config.stego_feature_dir.is_dir():
-        raise FileNotFoundError(f"Stego feature directory not found: {config.stego_feature_dir}")
+def _extract_features(config: LCLSMRConfig) -> tuple[list[Path], list[Path]]:
+    resolved_cover_image_dir = config.data_root / config.cover_dir_name
+    resolved_stego_image_dir = config.data_root / config.stego_dir_name
+    resolved_cover_feature_dir = config.feature_root / config.cover_dir_name
+    resolved_stego_feature_dir = config.feature_root / config.stego_dir_name
+    cover_features = extract_dir(
+        SRMDirConfig(
+            image_dir=resolved_cover_image_dir,
+            feature_dir=resolved_cover_feature_dir,
+            image_suffix=config.image_suffix,
+            gpu_devices=config.gpu_devices,
+            validation_suffix=config.fixed_val_suffix,
+            max_train_files=config.max_train_pairs,
+            max_val_files=config.max_val_pairs,
+        )
+    )
+    stego_features = extract_dir(
+        SRMDirConfig(
+            image_dir=resolved_stego_image_dir,
+            feature_dir=resolved_stego_feature_dir,
+            image_suffix=config.image_suffix,
+            gpu_devices=config.gpu_devices,
+            validation_suffix=config.fixed_val_suffix,
+            max_train_files=config.max_train_pairs,
+            max_val_files=config.max_val_pairs,
+        )
+    )
+    return cover_features, stego_features
+
+
+def _train_classifier_from_features(config: LCLSMRConfig) -> tuple[LCLSMRClassifier, dict[str, float]]:
+    resolved_cover_feature_dir = config.feature_root / config.cover_dir_name
+    resolved_stego_feature_dir = config.feature_root / config.stego_dir_name
+    if not resolved_cover_feature_dir.is_dir():
+        raise FileNotFoundError(f"Cover feature directory not found: {resolved_cover_feature_dir}")
+    if not resolved_stego_feature_dir.is_dir():
+        raise FileNotFoundError(f"Stego feature directory not found: {resolved_stego_feature_dir}")
 
     x_train, y_train, x_val, y_val = build_dataset(config)
     model = LCLSMRClassifier(
@@ -127,8 +166,17 @@ def train_classifier(config: LCLSMRConfig = CONFIG) -> tuple[LCLSMRClassifier, d
     return model, metrics
 
 
+def train_classifier(config: LCLSMRConfig = CONFIG) -> tuple[LCLSMRClassifier, dict[str, float]]:
+    _extract_features(config)
+    return _train_classifier_from_features(config)
+
+
+def detect(config: LCLSMRConfig = CONFIG) -> tuple[LCLSMRClassifier, dict[str, float]]:
+    return train_classifier(config)
+
+
 def main() -> None:
-    train_classifier(CONFIG)
+    detect(CONFIG)
 
 
 if __name__ == "__main__":
