@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
-from steganalysis.srnet import TrainConfig as SRNetConfig
+from steganalysis.lclsmr import LCLSMRConfig, train_classifier
+from steganalysis.srnet import SRNetConfig
 from steganalysis.srnet import train as train_srnet
 from steganalysis.srm import SRMDirConfig, extract_dir
-from steganalysis.train_features import TrainFeaturesConfig, train_classifier
 from steganography.embed_dir import EmbedDirConfig, embed_dir, generate_stego_dir
 from utils.files import save_json
 
@@ -17,7 +17,7 @@ class PipelineConfig:
     cover_dir_name: str = "cover"
     algorithm: str = "hill"
     payload: float = 0.4
-    stego_dir: Path | None = Path("data/BOSSbase_1.01/changeable-sweltering-draft")
+    stego_dir: Path | None = None
     feature_root: Path = Path("data/features")
     feature_model_root: Path = Path("data/features/models")
     run_root: Path = Path("runs")
@@ -27,15 +27,8 @@ class PipelineConfig:
     max_val_files: int | None = 100
     embed_workers: int | None = None
     srm_gpu_devices: tuple[str, ...] | None = None
-    feature_max_iter: int = 2000
-    srnet_epochs: int = 30
-    srnet_batch_size: int = 64
-    srnet_workers: int = 4
-    srnet_lr: float = 1e-3
-    srnet_min_lr: float = 1e-4
-    srnet_warmup_epochs: int = 3
-    srnet_amp: bool = False
-    srnet_wandb_mode: str = "offline"
+    lclsmr: LCLSMRConfig = field(default_factory=LCLSMRConfig)
+    srnet: SRNetConfig = field(default_factory=SRNetConfig)
 
 
 CONFIG = PipelineConfig()
@@ -60,6 +53,27 @@ def resolve_paths(config: PipelineConfig) -> dict[str, Path]:
 def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
     paths = resolve_paths(config)
     save_json(config.run_root / f"pipeline_{paths['stego_dir'].name}.json", asdict(config))
+
+    lclsmr_config = replace(
+        config.lclsmr,
+        cover_feature_dir=paths["cover_features"],
+        stego_feature_dir=paths["stego_features"],
+        output_dir=paths["linear_output"],
+        fixed_val_suffix=config.validation_suffix,
+        max_train_pairs=config.max_train_files,
+        max_val_pairs=config.max_val_files,
+    )
+    srnet_config = replace(
+        config.srnet,
+        data_root=config.data_root,
+        cover_dir=config.cover_dir_name,
+        stego_dir=paths["stego_dir"].name,
+        output_dir=paths["srnet_output"],
+        extensions=(config.image_extension,),
+        fixed_val_suffix=config.validation_suffix,
+        max_train_pairs=config.max_train_files,
+        max_val_pairs=config.max_val_files,
+    )
 
     embed_dir(
         EmbedDirConfig(
@@ -99,37 +113,11 @@ def run_pipeline(config: PipelineConfig = CONFIG) -> dict[str, Path]:
     )
 
     train_classifier(
-        TrainFeaturesConfig(
-            cover_feature_dir=paths["cover_features"],
-            stego_feature_dir=paths["stego_features"],
-            output_dir=paths["linear_output"],
-            feature_suffix=".npy",
-            max_iter=config.feature_max_iter,
-            fixed_val_suffix=config.validation_suffix,
-            max_train_pairs=config.max_train_files,
-            max_val_pairs=config.max_val_files,
-        )
+        lclsmr_config
     )
 
     train_srnet(
-        SRNetConfig(
-            data_root=config.data_root,
-            cover_dir=config.cover_dir_name,
-            stego_dir=paths["stego_dir"].name,
-            output_dir=paths["srnet_output"],
-            extensions=(config.image_extension,),
-            epochs=config.srnet_epochs,
-            batch_size=config.srnet_batch_size,
-            workers=config.srnet_workers,
-            lr=config.srnet_lr,
-            min_lr=config.srnet_min_lr,
-            warmup_epochs=config.srnet_warmup_epochs,
-            amp=config.srnet_amp,
-            wandb_mode=config.srnet_wandb_mode,
-            fixed_val_suffix=config.validation_suffix,
-            max_train_pairs=config.max_train_files,
-            max_val_pairs=config.max_val_files,
-        )
+        srnet_config
     )
 
     print(f"Linear report: {paths['linear_output'] / 'classification_report.txt'}")

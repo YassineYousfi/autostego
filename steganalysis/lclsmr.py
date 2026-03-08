@@ -1,34 +1,34 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import accuracy_score, log_loss
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
+from steganalysis._lclsmr import LCLSMRClassifier
 from utils.files import collect_files, relative_stem_set, save_json, split_relative_keys
 from utils.reports import save_classification_outputs
 
 
 @dataclass(slots=True)
-class TrainFeaturesConfig:
+class LCLSMRConfig:
     cover_feature_dir: Path = Path("data/features/BOSSbase_1.01/cover")
     stego_feature_dir: Path = Path("data/features/BOSSbase_1.01/hill")
     output_dir: Path = Path("data/features/models/hill_linear")
     feature_suffix: str = ".npy"
     seed: int = 1337
-    max_iter: int = 2000
+    cv_tolerance_grid: tuple[float, ...] = (3e-5, 1e-5, 3e-6, 1e-6)
+    cv_num_folds: int = 3
+    cv_maxiter: int = 30000
     fixed_val_suffix: str | None = "9"
     max_train_pairs: int | None = None
     max_val_pairs: int | None = None
 
 
-CONFIG = TrainFeaturesConfig()
+CONFIG = LCLSMRConfig()
 
 
 def pair_feature_paths(cover_dir: Path, stego_dir: Path, suffix: str) -> tuple[list[Path], list[Path]]:
@@ -60,7 +60,7 @@ def load_feature_matrix(paths: list[Path], label: int) -> tuple[np.ndarray, np.n
     return x, y
 
 
-def build_dataset(config: TrainFeaturesConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def build_dataset(config: LCLSMRConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cover_paths, stego_paths = pair_feature_paths(config.cover_feature_dir, config.stego_feature_dir, config.feature_suffix)
     common_keys = [str(path.relative_to(config.cover_feature_dir).with_suffix("")) for path in cover_paths]
     cover_lookup = {key: path for key, path in zip(common_keys, cover_paths, strict=True)}
@@ -90,22 +90,18 @@ def build_dataset(config: TrainFeaturesConfig) -> tuple[np.ndarray, np.ndarray, 
     return x_train, y_train, x_val, y_val
 
 
-def train_classifier(config: TrainFeaturesConfig = CONFIG) -> tuple[Pipeline, dict[str, float]]:
+def train_classifier(config: LCLSMRConfig = CONFIG) -> tuple[LCLSMRClassifier, dict[str, float]]:
     if not config.cover_feature_dir.is_dir():
         raise FileNotFoundError(f"Cover feature directory not found: {config.cover_feature_dir}")
     if not config.stego_feature_dir.is_dir():
         raise FileNotFoundError(f"Stego feature directory not found: {config.stego_feature_dir}")
 
     x_train, y_train, x_val, y_val = build_dataset(config)
-
-    model = Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "classifier",
-                SGDClassifier(loss="log_loss", random_state=config.seed, max_iter=config.max_iter),
-            ),
-        ]
+    model = LCLSMRClassifier(
+        random_state=config.seed,
+        cv_tolerance_grid=np.asarray(config.cv_tolerance_grid, dtype=np.float64),
+        cv_num_folds=config.cv_num_folds,
+        cv_maxiter=config.cv_maxiter,
     )
     model.fit(x_train, y_train)
 

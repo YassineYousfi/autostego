@@ -7,6 +7,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ import torch.distributed as dist
 import wandb
 from PIL import Image
 from sklearn.metrics import accuracy_score, log_loss
+from timm.models._manipulate import adapt_input_conv
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
@@ -22,13 +24,17 @@ from torch.utils.data.distributed import DistributedSampler
 from utils.files import relative_stem, save_json, select_split_paths, split_relative_keys
 from utils.reports import save_classification_outputs
 
+DEFAULT_SRNET_CHECKPOINT_PATH = Path("assets/checkpoints/jin_srnet.ckpt")
+
 
 @dataclass(slots=True)
-class TrainConfig:
+class SRNetConfig:
     data_root: Path = Path("data")
     cover_dir: str = "cover"
     stego_dir: str = "stego"
     output_dir: Path = Path("runs/srnet")
+    in_channels: int = 1
+    num_classes: int = 2
     extensions: tuple[str, ...] = (".ppm",)
     epochs: int = 30
     batch_size: int = 64
@@ -43,16 +49,63 @@ class TrainConfig:
     max_val_pairs: int | None = None
     amp: bool = False
     compile: bool = True
+    pretrained: bool = True
+    pretrained_checkpoint: str | Path = DEFAULT_SRNET_CHECKPOINT_PATH
+    strict_loading: bool = True
     wandb_project: str = "autostego-srnet"
     wandb_run_name: str | None = None
     wandb_mode: str = "offline"
 
 
-CONFIG = TrainConfig()
+CONFIG = SRNetConfig()
 
 
 def conv3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
     return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+def is_url(path_or_url: str | Path) -> bool:
+    if isinstance(path_or_url, Path):
+        return False
+    parsed = urlparse(path_or_url)
+    return parsed.scheme in {"http", "https"}
+
+
+def load_srnet_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str | Path = DEFAULT_SRNET_CHECKPOINT_PATH,
+    *,
+    strict_loading: bool = False,
+) -> torch.nn.modules.module._IncompatibleKeys:
+    if is_url(checkpoint_path):
+        checkpoint = torch.hub.load_state_dict_from_url(str(checkpoint_path), map_location="cpu", progress=True)
+    else:
+        checkpoint_file = Path(checkpoint_path)
+        if not checkpoint_file.exists():
+            raise FileNotFoundError(
+                f"SRNet checkpoint not found at {checkpoint_file}. "
+                "Generate it first with tests/scripts/remap_srnet_checkpoint.py."
+            )
+        checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+
+    raw_state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(raw_state_dict, dict):
+        raise TypeError("Unsupported checkpoint format for SRNet weights.")
+
+    target_state = model.state_dict()
+    loadable_state = dict(raw_state_dict)
+
+    head_weight_key = "head.weight"
+    head_bias_key = "head.bias"
+    if head_weight_key in loadable_state and loadable_state[head_weight_key].shape != target_state[head_weight_key].shape:
+        loadable_state.pop(head_weight_key, None)
+        loadable_state.pop(head_bias_key, None)
+
+    stem_weight_key = "features.0.0.weight"
+    if stem_weight_key in loadable_state and loadable_state[stem_weight_key].shape != target_state[stem_weight_key].shape:
+        loadable_state[stem_weight_key] = adapt_input_conv(target_state[stem_weight_key].shape[1], loadable_state[stem_weight_key])
+
+    return model.load_state_dict(loadable_state, strict=strict_loading)
 
 
 class ConvBNAct(nn.Sequential):
@@ -96,7 +149,15 @@ class DownsampleBlock(nn.Module):
 
 
 class SRNet(nn.Module):
-    def __init__(self, in_channels: int = 1, num_classes: int = 2) -> None:
+    def __init__(
+        self,
+        in_channels: int = 1,
+        num_classes: int = 2,
+        *,
+        pretrained: bool = False,
+        checkpoint_path: str | Path = DEFAULT_SRNET_CHECKPOINT_PATH,
+        strict_loading: bool = False,
+    ) -> None:
         super().__init__()
         self.features = nn.Sequential(
             ConvBNAct(in_channels, 64),
@@ -112,6 +173,8 @@ class SRNet(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Linear(512, num_classes)
+        if pretrained:
+            load_srnet_checkpoint(self, checkpoint_path=checkpoint_path, strict_loading=strict_loading)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.features(x)
@@ -208,7 +271,7 @@ def collect_images(root: Path, extensions: Sequence[str]) -> list[Path]:
     return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in allowed)
 
 
-def build_pairs(config: TrainConfig) -> tuple[list[CoverStegoPair], Path]:
+def build_pairs(config: SRNetConfig) -> tuple[list[CoverStegoPair], Path]:
     cover_root = config.data_root / config.cover_dir
     stego_root = config.data_root / config.stego_dir
     if not cover_root.is_dir():
@@ -264,7 +327,7 @@ def build_pairs(config: TrainConfig) -> tuple[list[CoverStegoPair], Path]:
 def split_pairs(
     pairs: Sequence[CoverStegoPair],
     cover_root: Path,
-    config: TrainConfig,
+    config: SRNetConfig,
 ) -> tuple[list[CoverStegoPair], list[CoverStegoPair]]:
     if config.fixed_val_suffix is None:
         raise ValueError("fixed_val_suffix must be set for SRNet training.")
@@ -409,14 +472,20 @@ def save_checkpoint(
         torch.save(checkpoint, output_dir / "best.pt")
 
 
-def build_model(config: TrainConfig, device: torch.device) -> nn.Module:
-    model = SRNet()
+def build_model(config: SRNetConfig, device: torch.device) -> nn.Module:
+    model = SRNet(
+        in_channels=config.in_channels,
+        num_classes=config.num_classes,
+        pretrained=config.pretrained,
+        checkpoint_path=config.pretrained_checkpoint,
+        strict_loading=config.strict_loading,
+    )
     if config.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     return model.to(device)
 
 
-def init_wandb(config: TrainConfig, ctx: DistributedContext) -> None:
+def init_wandb(config: SRNetConfig, ctx: DistributedContext) -> None:
     if not is_main_process(ctx):
         return
     wandb.init(
@@ -433,7 +502,7 @@ def finish_wandb(ctx: DistributedContext) -> None:
 
 
 def save_validation_outputs(
-    config: TrainConfig,
+    config: SRNetConfig,
     y_true: np.ndarray,
     y_pred: np.ndarray,
     y_prob: np.ndarray,
@@ -454,7 +523,7 @@ def save_validation_outputs(
     save_classification_outputs(config.output_dir, y_true, y_pred)
 
 
-def lr_for_epoch(config: TrainConfig, epoch: int) -> float:
+def lr_for_epoch(config: SRNetConfig, epoch: int) -> float:
     if config.epochs <= 1:
         return config.lr
 
@@ -474,7 +543,7 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         param_group["lr"] = lr
 
 
-def train(config: TrainConfig = CONFIG) -> None:
+def train(config: SRNetConfig = CONFIG) -> None:
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
