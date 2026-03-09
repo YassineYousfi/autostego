@@ -1,6 +1,6 @@
 # autostego
 
-<img width="1511" height="811" alt="image" src="https://github.com/user-attachments/assets/fda69c11-49f6-4e25-b125-5dedba62b54f" />
+<img width="1511" height="811" alt="image" src="https://github.com/user-attachments/assets/e4337b42-4cb8-45d5-bca8-9c3a3561f60d" />
 
 
 ## The game
@@ -17,7 +17,7 @@ The security of Alice's steganographic algorithm is measured under Kerckhoffs's 
 - Is Alice hiding a real message?
 
   No, Alice and Eve are simulating a payload using the algorithms. To embed a real message, one would need to implement the coding layer using Syndrome Trellis Codes for example. This is left as an exercise to the curious reader.
-  
+
 - Why not just use a GAN?
 
   It's tricky. Steganographic changes are usually tiny (+/- 1 pixels), evading one classifier might make you vulnerable to other types of classifiers, and they might not be differentiable.
