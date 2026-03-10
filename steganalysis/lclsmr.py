@@ -28,6 +28,8 @@ class LCLSMRConfig:
     cv_tolerance_grid: tuple[float, ...] = (3e-5, 1e-5, 3e-6, 1e-6)
     cv_num_folds: int = 3
     cv_maxiter: int = 30000
+    backend: str = "cv"
+    fast_tolerance: float = 1e-5
     fixed_val_suffix: str | None = "9"
     max_train_pairs: int | None = None
     max_val_pairs: int | None = None
@@ -141,6 +143,8 @@ def _train_classifier_from_features(config: LCLSMRConfig) -> tuple[LCLSMRClassif
         cv_tolerance_grid=np.asarray(config.cv_tolerance_grid, dtype=np.float64),
         cv_num_folds=config.cv_num_folds,
         cv_maxiter=config.cv_maxiter,
+        backend=config.backend,
+        tolerance=config.fast_tolerance,
     )
     model.fit(x_train, y_train)
 

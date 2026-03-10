@@ -54,6 +54,7 @@ class SRNetConfig:
     pretrained: bool = True
     pretrained_checkpoint: str | Path = DEFAULT_SRNET_CHECKPOINT_PATH
     strict_loading: bool = True
+    eval_d4: bool = False
     wandb_project: str = "autostego-srnet"
     wandb_run_name: str | None = None
     wandb_mode: str = "offline"
@@ -223,6 +224,15 @@ def augment_pair_images(images: Tensor) -> Tensor:
     if rotations:
         images = torch.rot90(images, k=rotations, dims=(-2, -1))
     return images
+
+
+def d4_transforms(images: Tensor) -> list[Tensor]:
+    transforms: list[Tensor] = []
+    for rotation in range(4):
+        rotated = torch.rot90(images, k=rotation, dims=(-2, -1))
+        transforms.append(rotated)
+        transforms.append(torch.flip(rotated, dims=(-1,)))
+    return transforms
 
 
 class PairDataset(Dataset[tuple[Tensor, Tensor]]):
@@ -458,6 +468,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     amp: bool = True,
     collect_predictions: bool = False,
+    eval_d4: bool = False,
 ) -> tuple[float, float, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     training = optimizer is not None
     model.train(training)
@@ -478,7 +489,10 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with autocast_context(device, amp and device.type != "cpu"):
-                logits = model(images)
+                if training or not eval_d4:
+                    logits = model(images)
+                else:
+                    logits = torch.stack([model(transformed) for transformed in d4_transforms(images)], dim=0).mean(dim=0)
                 loss = criterion(logits, labels)
             if training:
                 loss.backward()
@@ -598,6 +612,7 @@ def save_validation_outputs(
     report_stem = "classification_report" if label == "last" else f"classification_report_{label}"
     save_json(config.output_dir / metrics_name, metrics)
     save_json(config.output_dir / "train_config.json", asdict(config))
+    np.savez_compressed(config.output_dir / f"predictions_{label}.npz", y_true=y_true, y_pred=y_pred, y_prob=y_prob)
     save_classification_outputs(config.output_dir, y_true, y_pred, report_stem=report_stem)
 
 
@@ -703,6 +718,7 @@ def train(config: SRNetConfig = CONFIG) -> None:
                     optimizer=None,
                     amp=config.amp,
                     collect_predictions=True,
+                    eval_d4=config.eval_d4,
                 )
 
             if is_main_process(ctx):
@@ -747,6 +763,70 @@ def train(config: SRNetConfig = CONFIG) -> None:
 
 def detect(config: SRNetConfig = CONFIG) -> None:
     train(config)
+
+
+def evaluate_checkpoint(
+    config: SRNetConfig,
+    checkpoint_path: Path,
+    *,
+    label: str,
+    eval_d4: bool = False,
+) -> dict[str, float]:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    ctx = setup_distributed()
+    seed_everything(config.seed + ctx.rank)
+
+    try:
+        pairs, cover_root = build_pairs(config)
+        _, val_pairs = split_pairs(pairs, cover_root, config)
+        val_dataset = PairDataset(val_pairs, augment=False)
+        val_loader, _ = build_dataloader(
+            val_dataset,
+            config.batch_size,
+            config.workers,
+            ctx,
+            shuffle=False,
+            drop_last=False,
+            pad_distributed=False,
+        )
+
+        model = build_model(config, ctx.device)
+        raw_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = raw_checkpoint.get("model", raw_checkpoint)
+        incompatible = model.load_state_dict(state_dict, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError("SRNet checkpoint did not load cleanly for evaluation.")
+        if ctx.distributed:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[ctx.local_rank] if ctx.device.type == "cuda" else None,
+                output_device=ctx.local_rank if ctx.device.type == "cuda" else None,
+            )
+
+        criterion = nn.CrossEntropyLoss()
+        with torch.inference_mode():
+            _, _, y_true, y_pred, y_prob = run_epoch(
+                model,
+                val_loader,
+                criterion,
+                ctx.device,
+                ctx,
+                config.num_classes,
+                optimizer=None,
+                amp=config.amp,
+                collect_predictions=True,
+                eval_d4=eval_d4,
+            )
+        if is_main_process(ctx):
+            save_validation_outputs(config, y_true, y_pred, y_prob, train_pairs=0, val_pairs=len(val_pairs), label=label)
+            metrics_path = config.output_dir / ("metrics.json" if label == "last" else f"metrics_{label}.json")
+            return json.loads(metrics_path.read_text(encoding="utf-8"))
+        return {}
+    finally:
+        cleanup_distributed(ctx)
 
 
 def main() -> None:
