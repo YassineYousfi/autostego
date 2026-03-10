@@ -487,6 +487,52 @@ def _lclsmr_scipy_cv(
     )
 
 
+def _lclsmr_scipy_fast(
+    trn_cover: np.ndarray,
+    trn_stego: np.ndarray,
+    tst_cover: np.ndarray,
+    tst_stego: np.ndarray,
+    *,
+    lambda_: float = 1e-8,
+    tolerance: float = 1e-5,
+    conlim: float = 1e8,
+    maxiter: int = 30000,
+) -> LCLSMRResults:
+    trn_cover = np.asarray(trn_cover, dtype=np.float64)
+    trn_stego = np.asarray(trn_stego, dtype=np.float64)
+    tst_cover = np.asarray(tst_cover, dtype=np.float64)
+    tst_stego = np.asarray(tst_stego, dtype=np.float64)
+    _validate_feature_matrices(trn_cover, trn_stego, tst_cover, tst_stego)
+
+    learning_set = np.vstack((trn_cover, trn_stego))
+    y_learning = np.concatenate(
+        (-np.ones(trn_cover.shape[0], dtype=np.float64), np.ones(trn_stego.shape[0], dtype=np.float64))
+    )
+    projection = scipy_lsmr(
+        learning_set,
+        y_learning,
+        damp=lambda_,
+        atol=float(tolerance),
+        btol=float(tolerance),
+        conlim=float(conlim),
+        maxiter=int(maxiter),
+    )[0]
+
+    proj_testing_cover = tst_cover @ projection
+    proj_testing_stego = tst_stego @ projection
+    pfa, pmd, pe = _compute_error_curve(proj_testing_cover, proj_testing_stego)
+    return LCLSMRResults(
+        pfa=pfa,
+        pmd=pmd,
+        pe=pe,
+        selected_fold=0,
+        selected_tolerance=float(tolerance),
+        projection=projection,
+        validation_error=np.empty((0, 1), dtype=np.float64),
+        validation_min_error=np.empty((0,), dtype=np.float64),
+    )
+
+
 class LCLSMRClassifier(ClassifierMixin, BaseEstimator):
     def __init__(
         self,
@@ -496,12 +542,16 @@ class LCLSMRClassifier(ClassifierMixin, BaseEstimator):
         cv_tolerance_grid: np.ndarray | None = None,
         cv_num_folds: int = 3,
         cv_maxiter: int = 30000,
+        backend: str = "cv",
+        tolerance: float = 1e-5,
     ) -> None:
         self.lambda_ = lambda_
         self.random_state = random_state
         self.cv_tolerance_grid = cv_tolerance_grid
         self.cv_num_folds = cv_num_folds
         self.cv_maxiter = cv_maxiter
+        self.backend = backend
+        self.tolerance = tolerance
 
     def fit(self, x: np.ndarray, y: np.ndarray, pair_ids: np.ndarray | None = None) -> "LCLSMRClassifier":
         x = check_array(x, ensure_2d=True, dtype=np.float64)
@@ -534,17 +584,30 @@ class LCLSMRClassifier(ClassifierMixin, BaseEstimator):
             x_cover = x_cover[order_cover]
             x_stego = x_stego[order_stego]
 
-        results = _lclsmr_scipy_cv(
-            x_cover,
-            x_stego,
-            x_cover,
-            x_stego,
-            lambda_=self.lambda_,
-            tolerance_grid=self.cv_tolerance_grid,
-            num_folds=self.cv_num_folds,
-            random_state=self.random_state,
-            maxiter=self.cv_maxiter,
-        )
+        if self.backend == "cv":
+            results = _lclsmr_scipy_cv(
+                x_cover,
+                x_stego,
+                x_cover,
+                x_stego,
+                lambda_=self.lambda_,
+                tolerance_grid=self.cv_tolerance_grid,
+                num_folds=self.cv_num_folds,
+                random_state=self.random_state,
+                maxiter=self.cv_maxiter,
+            )
+        elif self.backend == "fast":
+            results = _lclsmr_scipy_fast(
+                x_cover,
+                x_stego,
+                x_cover,
+                x_stego,
+                lambda_=self.lambda_,
+                tolerance=self.tolerance,
+                maxiter=self.cv_maxiter,
+            )
+        else:
+            raise ValueError(f"Unsupported LCLSMR backend: {self.backend}")
         self.results_ = results
         self.coef_ = results.projection.reshape(1, -1)
         self.intercept_ = np.array([0.0], dtype=np.float64)
