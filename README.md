@@ -1,6 +1,6 @@
 # autostego
 
-<img width="1511" height="811" alt="image" src="https://github.com/user-attachments/assets/e4337b42-4cb8-45d5-bca8-9c3a3561f60d" />
+<img width="1611" height="993" alt="image" src="https://github.com/user-attachments/assets/9c74700c-2dd6-4404-b6c7-267f6058be0f" />
 
 
 ## The game
