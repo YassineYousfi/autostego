@@ -84,11 +84,6 @@ def extract_dir(config: SRMDirConfig = CONFIG) -> list[Path]:
     if not config.image_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {config.image_dir}")
 
-    if directory_is_nonempty(config.feature_dir):
-        output_paths = collect_files(config.feature_dir, ".npy")
-        print(f"Skipping SRM extraction, reusing existing features: {config.feature_dir}")
-        return output_paths
-
     image_paths = collect_files(config.image_dir, config.image_suffix)
     if not image_paths:
         raise FileNotFoundError(f"No images matching *{config.image_suffix} found in {config.image_dir}")
@@ -102,6 +97,15 @@ def extract_dir(config: SRMDirConfig = CONFIG) -> list[Path]:
     selected_images = train_images + val_images
     if not selected_images:
         raise ValueError("No images selected after applying split limits.")
+
+    if directory_is_nonempty(config.feature_dir):
+        existing_outputs = collect_files(config.feature_dir, ".npy")
+        if existing_outputs:
+            existing_keys = {path.relative_to(config.feature_dir).with_suffix("") for path in existing_outputs}
+            selected_keys = {path.relative_to(config.image_dir).with_suffix("") for path in selected_images}
+            if selected_keys.issubset(existing_keys):
+                print(f"Skipping SRM extraction, reusing existing features: {config.feature_dir}")
+                return sorted(config.feature_dir / key.with_suffix(".npy") for key in selected_keys)
 
     ensure_directory(config.feature_dir)
     metadata_path = save_feature_names(selected_images, config)
