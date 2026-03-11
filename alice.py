@@ -21,7 +21,7 @@ class PipelineConfig:
     data_root: Path = Path("data/BOSSbase_1.01")
     cover_dir_name: str = "cover"
     stego_dir_name: str = "changeable-sweltering-draft"
-    detectors: list[str] = field(default_factory=lambda: ["lclsmr", "srnet"])
+    detectors: list[str] = field(default_factory=lambda: ["lclsmr", "srnet", "fusion"])
     feature_root: Path = Path("data/features")
     feature_model_root: Path = Path("data/features/models")
     run_root: Path = Path("runs")
